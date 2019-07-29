@@ -16,7 +16,6 @@
 #include "qemu/error-report.h"
 #include "trace.h"
 #include "qemu-common.h"
-#include "qapi/qmp/qerror.h"
 #include "qapi/error.h"
 #include "net/net.h"
 #include "net/eth.h"
@@ -26,7 +25,6 @@
 #include "net/queue.h"
 #include "chardev/char-fe.h"
 #include "qemu/sockets.h"
-#include "qapi-visit.h"
 #include "net/colo.h"
 #include "sysemu/iothread.h"
 

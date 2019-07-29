@@ -106,6 +106,18 @@ static void tcg_out_movi(TCGContext *s, TCGType type,
                          TCGReg ret, tcg_target_long arg);
 static void tcg_out_op(TCGContext *s, TCGOpcode opc, const TCGArg *args,
                        const int *const_args);
+#if TCG_TARGET_MAYBE_vec
+static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc, unsigned vecl,
+                           unsigned vece, const TCGArg *args,
+                           const int *const_args);
+#else
+static inline void tcg_out_vec_op(TCGContext *s, TCGOpcode opc, unsigned vecl,
+                                  unsigned vece, const TCGArg *args,
+                                  const int *const_args)
+{
+    g_assert_not_reached();
+}
+#endif
 static void tcg_out_st(TCGContext *s, TCGType type, TCGReg arg, TCGReg arg1,
                        intptr_t arg2);
 static bool tcg_out_sti(TCGContext *s, TCGType type, TCGArg val,
@@ -146,8 +158,7 @@ struct tcg_region_state {
 };
 
 static struct tcg_region_state region;
-
-static TCGRegSet tcg_target_available_regs[2];
+static TCGRegSet tcg_target_available_regs[TCG_TYPE_COUNT];
 static TCGRegSet tcg_target_call_clobber_regs;
 
 #if TCG_TARGET_INSN_UNIT_SIZE == 1
@@ -280,6 +291,14 @@ TCGLabel *gen_new_label(void)
     };
 
     return l;
+}
+
+static void set_jmp_reset_offset(TCGContext *s, int which)
+{
+    size_t off = tcg_current_code_size(s);
+    s->tb_jmp_reset_offset[which] = off;
+    /* Make sure that we didn't overflow the stored offset.  */
+    assert(s->tb_jmp_reset_offset[which] == off);
 }
 
 #include "tcg-target.inc.c"
@@ -855,6 +874,7 @@ void tcg_func_start(TCGContext *s)
     /* No temps have been previously allocated for size or locality.  */
     memset(s->free_temps, 0, sizeof(s->free_temps));
 
+    s->nb_ops = 0;
     s->nb_labels = 0;
     s->current_frame_offset = s->frame_start;
 
@@ -1026,6 +1046,41 @@ TCGv_i64 tcg_temp_new_internal_i64(int temp_local)
     return temp_tcgv_i64(t);
 }
 
+TCGv_vec tcg_temp_new_vec(TCGType type)
+{
+    TCGTemp *t;
+
+#ifdef CONFIG_DEBUG_TCG
+    switch (type) {
+    case TCG_TYPE_V64:
+        assert(TCG_TARGET_HAS_v64);
+        break;
+    case TCG_TYPE_V128:
+        assert(TCG_TARGET_HAS_v128);
+        break;
+    case TCG_TYPE_V256:
+        assert(TCG_TARGET_HAS_v256);
+        break;
+    default:
+        g_assert_not_reached();
+    }
+#endif
+
+    t = tcg_temp_new_internal(type, 0);
+    return temp_tcgv_vec(t);
+}
+
+/* Create a new temp of the same type as an existing temp.  */
+TCGv_vec tcg_temp_new_vec_matching(TCGv_vec match)
+{
+    TCGTemp *t = tcgv_vec_temp(match);
+
+    tcg_debug_assert(t->temp_allocated != 0);
+
+    t = tcg_temp_new_internal(t->base_type, 0);
+    return temp_tcgv_vec(t);
+}
+
 static void tcg_temp_free_internal(TCGTemp *ts)
 {
     TCGContext *s = tcg_ctx;
@@ -1055,6 +1110,11 @@ void tcg_temp_free_i32(TCGv_i32 arg)
 void tcg_temp_free_i64(TCGv_i64 arg)
 {
     tcg_temp_free_internal(tcgv_i64_temp(arg));
+}
+
+void tcg_temp_free_vec(TCGv_vec arg)
+{
+    tcg_temp_free_internal(tcgv_vec_temp(arg));
 }
 
 TCGv_i32 tcg_const_i32(int32_t val)
@@ -1114,6 +1174,9 @@ int tcg_check_temp_count(void)
    Test the runtime variable that controls each opcode.  */
 bool tcg_op_supported(TCGOpcode op)
 {
+    const bool have_vec
+        = TCG_TARGET_HAS_v64 | TCG_TARGET_HAS_v128 | TCG_TARGET_HAS_v256;
+
     switch (op) {
     case INDEX_op_discard:
     case INDEX_op_set_label:
@@ -1327,10 +1390,47 @@ bool tcg_op_supported(TCGOpcode op)
     case INDEX_op_mulsh_i64:
         return TCG_TARGET_HAS_mulsh_i64;
 
-    case NB_OPS:
-        break;
+    case INDEX_op_mov_vec:
+    case INDEX_op_dup_vec:
+    case INDEX_op_dupi_vec:
+    case INDEX_op_ld_vec:
+    case INDEX_op_st_vec:
+    case INDEX_op_add_vec:
+    case INDEX_op_sub_vec:
+    case INDEX_op_and_vec:
+    case INDEX_op_or_vec:
+    case INDEX_op_xor_vec:
+    case INDEX_op_cmp_vec:
+        return have_vec;
+    case INDEX_op_dup2_vec:
+        return have_vec && TCG_TARGET_REG_BITS == 32;
+    case INDEX_op_not_vec:
+        return have_vec && TCG_TARGET_HAS_not_vec;
+    case INDEX_op_neg_vec:
+        return have_vec && TCG_TARGET_HAS_neg_vec;
+    case INDEX_op_andc_vec:
+        return have_vec && TCG_TARGET_HAS_andc_vec;
+    case INDEX_op_orc_vec:
+        return have_vec && TCG_TARGET_HAS_orc_vec;
+    case INDEX_op_mul_vec:
+        return have_vec && TCG_TARGET_HAS_mul_vec;
+    case INDEX_op_shli_vec:
+    case INDEX_op_shri_vec:
+    case INDEX_op_sari_vec:
+        return have_vec && TCG_TARGET_HAS_shi_vec;
+    case INDEX_op_shls_vec:
+    case INDEX_op_shrs_vec:
+    case INDEX_op_sars_vec:
+        return have_vec && TCG_TARGET_HAS_shs_vec;
+    case INDEX_op_shlv_vec:
+    case INDEX_op_shrv_vec:
+    case INDEX_op_sarv_vec:
+        return have_vec && TCG_TARGET_HAS_shv_vec;
+
+    default:
+        tcg_debug_assert(op > INDEX_op_last_generic && op < NB_OPS);
+        return true;
     }
-    g_assert_not_reached();
 }
 
 /* Note: we convert the 64 bit args to 32 bit and do some alignment
@@ -1661,6 +1761,11 @@ void tcg_dump_ops(TCGContext *s)
             nb_iargs = def->nb_iargs;
             nb_cargs = def->nb_cargs;
 
+            if (def->flags & TCG_OPF_VECTOR) {
+                col += qemu_log("v%d,e%d,", 64 << TCGOP_VECL(op),
+                                8 << TCGOP_VECE(op));
+            }
+
             k = 0;
             for (i = 0; i < nb_oargs; i++) {
                 if (k != 0) {
@@ -1685,6 +1790,7 @@ void tcg_dump_ops(TCGContext *s)
             case INDEX_op_brcond_i64:
             case INDEX_op_setcond_i64:
             case INDEX_op_movcond_i64:
+            case INDEX_op_cmp_vec:
                 if (op->args[k] < ARRAY_SIZE(cond_name)
                     && cond_name[op->args[k]]) {
                     col += qemu_log(",%s", cond_name[op->args[k++]]);
@@ -1886,6 +1992,7 @@ void tcg_op_remove(TCGContext *s, TCGOp *op)
 {
     QTAILQ_REMOVE(&s->ops, op, link);
     QTAILQ_INSERT_TAIL(&s->free_ops, op, link);
+    s->nb_ops--;
 
 #ifdef CONFIG_PROFILER
     atomic_set(&s->prof.del_op_count, s->prof.del_op_count + 1);
@@ -1905,6 +2012,7 @@ static TCGOp *tcg_op_alloc(TCGOpcode opc)
     }
     memset(op, 0, offsetof(TCGOp, link));
     op->opc = opc;
+    s->nb_ops++;
 
     return op;
 }
@@ -2890,8 +2998,13 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
     }
 
     /* emit instruction */
-    tcg_out_op(s, op->opc, new_args, const_args);
-    
+    if (def->flags & TCG_OPF_VECTOR) {
+        tcg_out_vec_op(s, op->opc, TCGOP_VECL(op), TCGOP_VECE(op),
+                       new_args, const_args);
+    } else {
+        tcg_out_op(s, op->opc, new_args, const_args);
+    }
+
     /* move the outputs in the correct register if needed */
     for(i = 0; i < nb_oargs; i++) {
         ts = arg_temp(op->args[i]);
@@ -3239,15 +3352,20 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb)
         switch (opc) {
         case INDEX_op_mov_i32:
         case INDEX_op_mov_i64:
+        case INDEX_op_mov_vec:
             tcg_reg_alloc_mov(s, op);
             break;
         case INDEX_op_movi_i32:
         case INDEX_op_movi_i64:
+        case INDEX_op_dupi_vec:
             tcg_reg_alloc_movi(s, op);
             break;
         case INDEX_op_insn_start:
             if (num_insns >= 0) {
-                s->gen_insn_end_off[num_insns] = tcg_current_code_size(s);
+                size_t off = tcg_current_code_size(s);
+                s->gen_insn_end_off[num_insns] = off;
+                /* Assert that we do not overflow our stored offset.  */
+                assert(s->gen_insn_end_off[num_insns] == off);
             }
             num_insns++;
             for (i = 0; i < TARGET_INSN_START_WORDS; ++i) {
@@ -3645,3 +3763,10 @@ void tcg_register_jit(void *buf, size_t buf_size)
 {
 }
 #endif /* ELF_HOST_MACHINE */
+
+#if !TCG_TARGET_MAYBE_vec
+void tcg_expand_vec_op(TCGOpcode o, TCGType t, unsigned e, TCGArg a0, ...)
+{
+    g_assert_not_reached();
+}
+#endif

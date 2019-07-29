@@ -23,15 +23,25 @@
 #include "qemu/config-file.h"
 #include "qemu/option.h"
 #include "qemu/timer.h"
-#include "qmp-commands.h"
 #include "qemu/sockets.h"
 #include "monitor/monitor.h"
 #include "monitor/qdev.h"
+#include "qapi/error.h"
 #include "qapi/opts-visitor.h"
+#include "qapi/qapi-builtin-visit.h"
+#include "qapi/qapi-commands-block.h"
+#include "qapi/qapi-commands-char.h"
+#include "qapi/qapi-commands-migration.h"
+#include "qapi/qapi-commands-misc.h"
+#include "qapi/qapi-commands-net.h"
+#include "qapi/qapi-commands-rocker.h"
+#include "qapi/qapi-commands-run-state.h"
+#include "qapi/qapi-commands-tpm.h"
+#include "qapi/qapi-commands-ui.h"
+#include "qapi/qmp/qdict.h"
 #include "qapi/qmp/qerror.h"
 #include "qapi/string-input-visitor.h"
 #include "qapi/string-output-visitor.h"
-#include "qapi-visit.h"
 #include "qom/object_interfaces.h"
 #include "ui/console.h"
 #include "block/nbd.h"
@@ -358,50 +368,23 @@ void hmp_info_migrate_cache_size(Monitor *mon, const QDict *qdict)
 
 void hmp_info_cpus(Monitor *mon, const QDict *qdict)
 {
-    CpuInfoList *cpu_list, *cpu;
+    CpuInfoFastList *cpu_list, *cpu;
 
-    cpu_list = qmp_query_cpus(NULL);
+    cpu_list = qmp_query_cpus_fast(NULL);
 
     for (cpu = cpu_list; cpu; cpu = cpu->next) {
         int active = ' ';
 
-        if (cpu->value->CPU == monitor_get_cpu_index()) {
+        if (cpu->value->cpu_index == monitor_get_cpu_index()) {
             active = '*';
         }
 
-        monitor_printf(mon, "%c CPU #%" PRId64 ":", active, cpu->value->CPU);
-
-        switch (cpu->value->arch) {
-        case CPU_INFO_ARCH_X86:
-            monitor_printf(mon, " pc=0x%016" PRIx64, cpu->value->u.x86.pc);
-            break;
-        case CPU_INFO_ARCH_PPC:
-            monitor_printf(mon, " nip=0x%016" PRIx64, cpu->value->u.ppc.nip);
-            break;
-        case CPU_INFO_ARCH_SPARC:
-            monitor_printf(mon, " pc=0x%016" PRIx64,
-                           cpu->value->u.q_sparc.pc);
-            monitor_printf(mon, " npc=0x%016" PRIx64,
-                           cpu->value->u.q_sparc.npc);
-            break;
-        case CPU_INFO_ARCH_MIPS:
-            monitor_printf(mon, " PC=0x%016" PRIx64, cpu->value->u.q_mips.PC);
-            break;
-        case CPU_INFO_ARCH_TRICORE:
-            monitor_printf(mon, " PC=0x%016" PRIx64, cpu->value->u.tricore.PC);
-            break;
-        default:
-            break;
-        }
-
-        if (cpu->value->halted) {
-            monitor_printf(mon, " (halted)");
-        }
-
+        monitor_printf(mon, "%c CPU #%" PRId64 ":", active,
+                       cpu->value->cpu_index);
         monitor_printf(mon, " thread_id=%" PRId64 "\n", cpu->value->thread_id);
     }
 
-    qapi_free_CpuInfoList(cpu_list);
+    qapi_free_CpuInfoFastList(cpu_list);
 }
 
 static void print_block_info(Monitor *mon, BlockInfo *info,
@@ -1338,7 +1321,7 @@ void hmp_savevm(Monitor *mon, const QDict *qdict)
 void hmp_delvm(Monitor *mon, const QDict *qdict)
 {
     BlockDriverState *bs;
-    Error *err;
+    Error *err = NULL;
     const char *name = qdict_get_str(qdict, "name");
 
     if (bdrv_all_delete_snapshot(name, &bs, &err) < 0) {
@@ -2157,9 +2140,11 @@ err_out:
 void hmp_screendump(Monitor *mon, const QDict *qdict)
 {
     const char *filename = qdict_get_str(qdict, "filename");
+    const char *id = qdict_get_try_str(qdict, "device");
+    int64_t head = qdict_get_try_int(qdict, "head", 0);
     Error *err = NULL;
 
-    qmp_screendump(filename, &err);
+    qmp_screendump(filename, id != NULL, id, id != NULL, head, &err);
     hmp_handle_error(mon, &err);
 }
 
@@ -2438,7 +2423,18 @@ void hmp_info_memory_devices(Monitor *mon, const QDict *qdict)
             switch (value->type) {
             case MEMORY_DEVICE_INFO_KIND_DIMM:
                 di = value->u.dimm.data;
+                break;
 
+            case MEMORY_DEVICE_INFO_KIND_NVDIMM:
+                di = value->u.nvdimm.data;
+                break;
+
+            default:
+                di = NULL;
+                break;
+            }
+
+            if (di) {
                 monitor_printf(mon, "Memory device [%s]: \"%s\"\n",
                                MemoryDeviceInfoKind_str(value->type),
                                di->id ? di->id : "");
@@ -2451,9 +2447,6 @@ void hmp_info_memory_devices(Monitor *mon, const QDict *qdict)
                                di->hotplugged ? "true" : "false");
                 monitor_printf(mon, "  hotpluggable: %s\n",
                                di->hotpluggable ? "true" : "false");
-                break;
-            default:
-                break;
             }
         }
     }

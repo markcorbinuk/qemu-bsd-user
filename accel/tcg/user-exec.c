@@ -168,7 +168,7 @@ static inline int handle_cpu_signal(uintptr_t pc, siginfo_t *info,
     }
 
     /* Now we have a real cpu fault.  */
-    cpu_restore_state(cpu, pc);
+    cpu_restore_state(cpu, pc, true);
 
     sigprocmask(SIG_SETMASK, old_set, NULL);
     cpu_loop_exit(cpu);
@@ -507,39 +507,6 @@ int cpu_signal_handler(int host_signum, void *pinfo, void *puc)
                 || (insn & 0x3a400000) == 0x28000000); /* C3.3.7,14-16 */
 
     return handle_cpu_signal(pc, info, is_write, &uc->uc_sigmask);
-}
-
-#elif defined(__ia64)
-
-#ifndef __ISR_VALID
-  /* This ought to be in <bits/siginfo.h>... */
-# define __ISR_VALID    1
-#endif
-
-int cpu_signal_handler(int host_signum, void *pinfo, void *puc)
-{
-    siginfo_t *info = pinfo;
-    ucontext_t *uc = puc;
-    unsigned long ip;
-    int is_write = 0;
-
-    ip = uc->uc_mcontext.sc_ip;
-    switch (host_signum) {
-    case SIGILL:
-    case SIGFPE:
-    case SIGSEGV:
-    case SIGBUS:
-    case SIGTRAP:
-        if (info->si_code && (info->si_segvflags & __ISR_VALID)) {
-            /* ISR.W (write-access) is bit 33:  */
-            is_write = (info->si_isr >> 33) & 1;
-        }
-        break;
-
-    default:
-        break;
-    }
-    return handle_cpu_signal(ip, info, is_write, (sigset_t *)&uc->uc_sigmask);
 }
 
 #elif defined(__s390__)

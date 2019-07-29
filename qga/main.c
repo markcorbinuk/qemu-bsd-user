@@ -10,6 +10,7 @@
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
  * See the COPYING file in the top-level directory.
  */
+
 #include "qemu/osdep.h"
 #include <getopt.h>
 #include <glib/gstdio.h>
@@ -19,11 +20,14 @@
 #endif
 #include "qapi/qmp/json-streamer.h"
 #include "qapi/qmp/json-parser.h"
+#include "qapi/qmp/qdict.h"
 #include "qapi/qmp/qjson.h"
+#include "qapi/qmp/qstring.h"
 #include "qga/guest-agent-core.h"
 #include "qemu/module.h"
+#include "qga-qapi-commands.h"
 #include "qapi/qmp/qerror.h"
-#include "qapi/qmp/dispatch.h"
+#include "qapi/error.h"
 #include "qga/channel.h"
 #include "qemu/bswap.h"
 #include "qemu/help_option.h"
@@ -214,7 +218,7 @@ static void usage(const char *cmd)
 {
     printf(
 "Usage: %s [-m <method> -p <path>] [<options>]\n"
-"QEMU Guest Agent " QEMU_VERSION QEMU_PKGVERSION "\n"
+"QEMU Guest Agent " QEMU_FULL_VERSION "\n"
 QEMU_COPYRIGHT "\n"
 "\n"
 "  -m, --method      transport method: one of unix-listen, virtio-serial,\n"
@@ -596,46 +600,42 @@ static void process_command(GAState *s, QDict *req)
 static void process_event(JSONMessageParser *parser, GQueue *tokens)
 {
     GAState *s = container_of(parser, GAState, parser);
-    QDict *qdict;
+    QObject *obj;
+    QDict *req, *rsp;
     Error *err = NULL;
     int ret;
 
     g_assert(s && parser);
 
     g_debug("process_event: called");
-    qdict = qobject_to_qdict(json_parser_parse_err(tokens, NULL, &err));
-    if (err || !qdict) {
-        QDECREF(qdict);
-        qdict = qdict_new();
-        if (!err) {
-            g_warning("failed to parse event: unknown error");
-            error_setg(&err, QERR_JSON_PARSING);
-        } else {
-            g_warning("failed to parse event: %s", error_get_pretty(err));
-        }
-        qdict_put_obj(qdict, "error", qmp_build_error_object(err));
-        error_free(err);
+    obj = json_parser_parse_err(tokens, NULL, &err);
+    if (err) {
+        goto err;
+    }
+    req = qobject_to(QDict, obj);
+    if (!req) {
+        error_setg(&err, QERR_JSON_PARSING);
+        goto err;
+    }
+    if (!qdict_haskey(req, "execute")) {
+        g_warning("unrecognized payload format");
+        error_setg(&err, QERR_UNSUPPORTED);
+        goto err;
     }
 
-    /* handle host->guest commands */
-    if (qdict_haskey(qdict, "execute")) {
-        process_command(s, qdict);
-    } else {
-        if (!qdict_haskey(qdict, "error")) {
-            QDECREF(qdict);
-            qdict = qdict_new();
-            g_warning("unrecognized payload format");
-            error_setg(&err, QERR_UNSUPPORTED);
-            qdict_put_obj(qdict, "error", qmp_build_error_object(err));
-            error_free(err);
-        }
-        ret = send_response(s, QOBJECT(qdict));
-        if (ret < 0) {
-            g_warning("error sending error response: %s", strerror(-ret));
-        }
-    }
+    process_command(s, req);
+    qobject_decref(obj);
+    return;
 
-    QDECREF(qdict);
+err:
+    g_warning("failed to parse event: %s", error_get_pretty(err));
+    rsp = qmp_error_response(err);
+    ret = send_response(s, QOBJECT(rsp));
+    if (ret < 0) {
+        g_warning("error sending error response: %s", strerror(-ret));
+    }
+    QDECREF(rsp);
+    qobject_decref(obj);
 }
 
 /* false return signals GAChannel to close the current client connection */

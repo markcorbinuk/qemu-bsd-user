@@ -1,9 +1,12 @@
 #include "qemu/osdep.h"
+#include "qapi/error.h"
+#include "qapi/qapi-commands-misc.h"
+#include "qapi/qmp/qdict.h"
+#include "qapi/qmp/qlist.h"
 #include "qemu-common.h"
 #include "qemu/error-report.h"
 #include "qemu/option.h"
 #include "qemu/config-file.h"
-#include "qmp-commands.h"
 
 static QemuOptsList *vm_config_groups[48];
 static QemuOptsList *drive_config_groups[5];
@@ -525,7 +528,7 @@ static void config_parse_qdict_section(QDict *options, QemuOptsList *opts,
         }
 
         QLIST_FOREACH_ENTRY(list, list_entry) {
-            QDict *section = qobject_to_qdict(qlist_entry_obj(list_entry));
+            QDict *section = qobject_to(QDict, qlist_entry_obj(list_entry));
             char *opt_name;
 
             if (!section) {

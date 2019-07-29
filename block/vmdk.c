@@ -30,6 +30,7 @@
 #include "qapi/qmp/qerror.h"
 #include "qemu/error-report.h"
 #include "qemu/module.h"
+#include "qemu/option.h"
 #include "qemu/bswap.h"
 #include "migration/blocker.h"
 #include "qemu/cutils.h"
@@ -45,6 +46,8 @@
 #define VMDK4_FLAG_COMPRESS (1 << 16)
 #define VMDK4_FLAG_MARKER (1 << 17)
 #define VMDK4_GD_AT_END 0xffffffffffffffffULL
+
+#define VMDK_EXTENT_MAX_SECTORS (1ULL << 32)
 
 #define VMDK_GTE_ZEROED 0x1
 
@@ -1249,6 +1252,10 @@ static int get_cluster_offset(BlockDriverState *bs,
             return zeroed ? VMDK_ZEROED : VMDK_UNALLOC;
         }
 
+        if (extent->next_cluster_sector >= VMDK_EXTENT_MAX_SECTORS) {
+            return VMDK_ERROR;
+        }
+
         cluster_sector = extent->next_cluster_sector;
         extent->next_cluster_sector += extent->cluster_sectors;
 
@@ -1303,33 +1310,27 @@ static inline uint64_t vmdk_find_offset_in_cluster(VmdkExtent *extent,
     return extent_relative_offset % cluster_size;
 }
 
-static inline uint64_t vmdk_find_index_in_cluster(VmdkExtent *extent,
-                                                  int64_t sector_num)
-{
-    uint64_t offset;
-    offset = vmdk_find_offset_in_cluster(extent, sector_num * BDRV_SECTOR_SIZE);
-    return offset / BDRV_SECTOR_SIZE;
-}
-
-static int64_t coroutine_fn vmdk_co_get_block_status(BlockDriverState *bs,
-        int64_t sector_num, int nb_sectors, int *pnum, BlockDriverState **file)
+static int coroutine_fn vmdk_co_block_status(BlockDriverState *bs,
+                                             bool want_zero,
+                                             int64_t offset, int64_t bytes,
+                                             int64_t *pnum, int64_t *map,
+                                             BlockDriverState **file)
 {
     BDRVVmdkState *s = bs->opaque;
     int64_t index_in_cluster, n, ret;
-    uint64_t offset;
+    uint64_t cluster_offset;
     VmdkExtent *extent;
 
-    extent = find_extent(s, sector_num, NULL);
+    extent = find_extent(s, offset >> BDRV_SECTOR_BITS, NULL);
     if (!extent) {
-        return 0;
+        return -EIO;
     }
     qemu_co_mutex_lock(&s->lock);
-    ret = get_cluster_offset(bs, extent, NULL,
-                             sector_num * 512, false, &offset,
+    ret = get_cluster_offset(bs, extent, NULL, offset, false, &cluster_offset,
                              0, 0);
     qemu_co_mutex_unlock(&s->lock);
 
-    index_in_cluster = vmdk_find_index_in_cluster(extent, sector_num);
+    index_in_cluster = vmdk_find_offset_in_cluster(extent, offset);
     switch (ret) {
     case VMDK_ERROR:
         ret = -EIO;
@@ -1344,18 +1345,14 @@ static int64_t coroutine_fn vmdk_co_get_block_status(BlockDriverState *bs,
         ret = BDRV_BLOCK_DATA;
         if (!extent->compressed) {
             ret |= BDRV_BLOCK_OFFSET_VALID;
-            ret |= (offset + (index_in_cluster << BDRV_SECTOR_BITS))
-                    & BDRV_BLOCK_OFFSET_MASK;
+            *map = cluster_offset + index_in_cluster;
         }
         *file = extent->file->bs;
         break;
     }
 
-    n = extent->cluster_sectors - index_in_cluster;
-    if (n > nb_sectors) {
-        n = nb_sectors;
-    }
-    *pnum = n;
+    n = extent->cluster_sectors * BDRV_SECTOR_SIZE - index_in_cluster;
+    *pnum = MIN(n, bytes);
     return ret;
 }
 
@@ -1891,7 +1888,8 @@ static int filename_decompose(const char *filename, char *path, char *prefix,
     return VMDK_OK;
 }
 
-static int vmdk_create(const char *filename, QemuOpts *opts, Error **errp)
+static int coroutine_fn vmdk_co_create_opts(const char *filename, QemuOpts *opts,
+                                            Error **errp)
 {
     int idx = 0;
     BlockBackend *new_blk = NULL;
@@ -2229,8 +2227,9 @@ static ImageInfo *vmdk_get_extent_info(VmdkExtent *extent)
     return info;
 }
 
-static int vmdk_check(BlockDriverState *bs, BdrvCheckResult *result,
-                      BdrvCheckMode fix)
+static int coroutine_fn vmdk_co_check(BlockDriverState *bs,
+                                      BdrvCheckResult *result,
+                                      BdrvCheckMode fix)
 {
     BDRVVmdkState *s = bs->opaque;
     VmdkExtent *extent = NULL;
@@ -2399,7 +2398,7 @@ static BlockDriver bdrv_vmdk = {
     .instance_size                = sizeof(BDRVVmdkState),
     .bdrv_probe                   = vmdk_probe,
     .bdrv_open                    = vmdk_open,
-    .bdrv_check                   = vmdk_check,
+    .bdrv_co_check                = vmdk_co_check,
     .bdrv_reopen_prepare          = vmdk_reopen_prepare,
     .bdrv_child_perm              = bdrv_format_default_perms,
     .bdrv_co_preadv               = vmdk_co_preadv,
@@ -2407,9 +2406,9 @@ static BlockDriver bdrv_vmdk = {
     .bdrv_co_pwritev_compressed   = vmdk_co_pwritev_compressed,
     .bdrv_co_pwrite_zeroes        = vmdk_co_pwrite_zeroes,
     .bdrv_close                   = vmdk_close,
-    .bdrv_create                  = vmdk_create,
+    .bdrv_co_create_opts          = vmdk_co_create_opts,
     .bdrv_co_flush_to_disk        = vmdk_co_flush,
-    .bdrv_co_get_block_status     = vmdk_co_get_block_status,
+    .bdrv_co_block_status         = vmdk_co_block_status,
     .bdrv_get_allocated_file_size = vmdk_get_allocated_file_size,
     .bdrv_has_zero_init           = vmdk_has_zero_init,
     .bdrv_get_specific_info       = vmdk_get_specific_info,

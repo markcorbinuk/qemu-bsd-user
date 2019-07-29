@@ -22,6 +22,7 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+
 #include "qemu/osdep.h"
 #include "hw/hw.h"
 #include "hw/pci/pci.h"
@@ -33,6 +34,7 @@
 #include "sysemu/dma.h"
 #include "hw/block/block.h"
 #include "sysemu/block-backend.h"
+#include "qapi/error.h"
 #include "qemu/cutils.h"
 
 #include "hw/ide/internal.h"
@@ -400,7 +402,6 @@ typedef struct TrimAIOCB {
     QEMUIOVector *qiov;
     BlockAIOCB *aiocb;
     int i, j;
-    bool is_invalid;
 } TrimAIOCB;
 
 static void trim_aio_cancel(BlockAIOCB *acb)
@@ -428,11 +429,8 @@ static void ide_trim_bh_cb(void *opaque)
 {
     TrimAIOCB *iocb = opaque;
 
-    if (iocb->is_invalid) {
-        ide_dma_error(iocb->s);
-    } else {
-        iocb->common.cb(iocb->common.opaque, iocb->ret);
-    }
+    iocb->common.cb(iocb->common.opaque, iocb->ret);
+
     qemu_bh_delete(iocb->bh);
     iocb->bh = NULL;
     qemu_aio_unref(iocb);
@@ -460,7 +458,7 @@ static void ide_issue_trim_cb(void *opaque, int ret)
                 }
 
                 if (!ide_sect_range_ok(s, sector, count)) {
-                    iocb->is_invalid = true;
+                    iocb->ret = -EINVAL;
                     goto done;
                 }
 
@@ -500,7 +498,6 @@ BlockAIOCB *ide_issue_trim(
     iocb->qiov = qiov;
     iocb->i = -1;
     iocb->j = 0;
-    iocb->is_invalid = false;
     ide_issue_trim_cb(iocb, 0);
     return &iocb->common;
 }
@@ -846,6 +843,12 @@ static void ide_dma_cb(void *opaque, int ret)
     if (ret == -ECANCELED) {
         return;
     }
+
+    if (ret == -EINVAL) {
+        ide_dma_error(s);
+        return;
+    }
+
     if (ret < 0) {
         if (ide_handle_rw_error(s, -ret, ide_dma_cmd_to_retry(s->dma_cmd))) {
             s->bus->dma->aiocb = NULL;
@@ -1085,15 +1088,7 @@ static void ide_flush_cache(IDEState *s)
     s->status |= BUSY_STAT;
     ide_set_retry(s);
     block_acct_start(blk_get_stats(s->blk), &s->acct, 0, BLOCK_ACCT_FLUSH);
-
-    if (blk_bs(s->blk)) {
-        s->pio_aiocb = blk_aio_flush(s->blk, ide_flush_cb, s);
-    } else {
-        /* XXX blk_aio_flush() crashes when blk_bs(blk) is NULL, remove this
-         * temporary workaround when blk_aio_*() functions handle NULL blk_bs.
-         */
-        ide_flush_cb(s, 0);
-    }
+    s->pio_aiocb = blk_aio_flush(s->blk, ide_flush_cb, s);
 }
 
 static void ide_cfata_metadata_inquiry(IDEState *s)

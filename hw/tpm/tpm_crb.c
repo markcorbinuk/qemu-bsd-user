@@ -26,8 +26,10 @@
 #include "hw/acpi/tpm.h"
 #include "migration/vmstate.h"
 #include "sysemu/tpm_backend.h"
+#include "sysemu/reset.h"
 #include "tpm_int.h"
 #include "tpm_util.h"
+#include "trace.h"
 
 typedef struct CRBState {
     DeviceState parent_obj;
@@ -42,14 +44,6 @@ typedef struct CRBState {
 } CRBState;
 
 #define CRB(obj) OBJECT_CHECK(CRBState, (obj), TYPE_TPM_CRB)
-
-#define DEBUG_CRB 0
-
-#define DPRINTF(fmt, ...) do {                  \
-        if (DEBUG_CRB) {                        \
-            printf(fmt, ## __VA_ARGS__);        \
-        }                                       \
-    } while (0)
 
 #define CRB_INTF_TYPE_CRB_ACTIVE 0b1
 #define CRB_INTF_VERSION_CRB 0b1
@@ -82,6 +76,8 @@ enum crb_cancel {
     CRB_CANCEL_INVOKE = BIT(0),
 };
 
+#define TPM_CRB_NO_LOCALITY 0xff
+
 static uint64_t tpm_crb_mmio_read(void *opaque, hwaddr addr,
                                   unsigned size)
 {
@@ -90,17 +86,32 @@ static uint64_t tpm_crb_mmio_read(void *opaque, hwaddr addr,
     unsigned offset = addr & 3;
     uint32_t val = *(uint32_t *)regs >> (8 * offset);
 
-    DPRINTF("CRB read 0x" TARGET_FMT_plx " len:%u val: 0x%" PRIx32 "\n",
-            addr, size, val);
+    switch (addr) {
+    case A_CRB_LOC_STATE:
+        val |= !tpm_backend_get_tpm_established_flag(s->tpmbe);
+        break;
+    }
+
+    trace_tpm_crb_mmio_read(addr, size, val);
+
     return val;
+}
+
+static uint8_t tpm_crb_get_active_locty(CRBState *s)
+{
+    if (!ARRAY_FIELD_EX32(s->regs, CRB_LOC_STATE, locAssigned)) {
+        return TPM_CRB_NO_LOCALITY;
+    }
+    return ARRAY_FIELD_EX32(s->regs, CRB_LOC_STATE, activeLocality);
 }
 
 static void tpm_crb_mmio_write(void *opaque, hwaddr addr,
                                uint64_t val, unsigned size)
 {
     CRBState *s = CRB(opaque);
-    DPRINTF("CRB write 0x" TARGET_FMT_plx " len:%u val: 0x%" PRIx64 "\n",
-            addr, size, val);
+    uint8_t locty =  addr >> 12;
+
+    trace_tpm_crb_mmio_write(addr, size, val);
 
     switch (addr) {
     case A_CRB_CTRL_REQ:
@@ -123,7 +134,8 @@ static void tpm_crb_mmio_write(void *opaque, hwaddr addr,
         break;
     case A_CRB_CTRL_START:
         if (val == CRB_START_INVOKE &&
-            !(s->regs[R_CRB_CTRL_START] & CRB_START_INVOKE)) {
+            !(s->regs[R_CRB_CTRL_START] & CRB_START_INVOKE) &&
+            tpm_crb_get_active_locty(s) == locty) {
             void *mem = memory_region_get_ram_ptr(&s->cmdmem);
 
             s->regs[R_CRB_CTRL_START] |= CRB_START_INVOKE;
@@ -143,6 +155,10 @@ static void tpm_crb_mmio_write(void *opaque, hwaddr addr,
             /* not loc 3 or 4 */
             break;
         case CRB_LOC_CTRL_RELINQUISH:
+            ARRAY_FIELD_DP32(s->regs, CRB_LOC_STATE,
+                             locAssigned, 0);
+            ARRAY_FIELD_DP32(s->regs, CRB_LOC_STS,
+                             Granted, 0);
             break;
         case CRB_LOC_CTRL_REQUEST_ACCESS:
             ARRAY_FIELD_DP32(s->regs, CRB_LOC_STS,
@@ -151,8 +167,6 @@ static void tpm_crb_mmio_write(void *opaque, hwaddr addr,
                              beenSeized, 0);
             ARRAY_FIELD_DP32(s->regs, CRB_LOC_STATE,
                              locAssigned, 1);
-            ARRAY_FIELD_DP32(s->regs, CRB_LOC_STATE,
-                             tpmRegValidSts, 1);
             break;
         }
         break;
@@ -210,31 +224,18 @@ static Property tpm_crb_properties[] = {
     DEFINE_PROP_END_OF_LIST(),
 };
 
-static void tpm_crb_realize(DeviceState *dev, Error **errp)
+static void tpm_crb_reset(void *dev)
 {
     CRBState *s = CRB(dev);
 
-    if (!tpm_find()) {
-        error_setg(errp, "at most one TPM device is permitted");
-        return;
-    }
-    if (!s->tpmbe) {
-        error_setg(errp, "'tpmdev' property is required");
-        return;
-    }
-
-    memory_region_init_io(&s->mmio, OBJECT(s), &tpm_crb_memory_ops, s,
-        "tpm-crb-mmio", sizeof(s->regs));
-    memory_region_init_ram(&s->cmdmem, OBJECT(s),
-        "tpm-crb-cmd", CRB_CTRL_CMD_SIZE, errp);
-
-    memory_region_add_subregion(get_system_memory(),
-        TPM_CRB_ADDR_BASE, &s->mmio);
-    memory_region_add_subregion(get_system_memory(),
-        TPM_CRB_ADDR_BASE + sizeof(s->regs), &s->cmdmem);
-
     tpm_backend_reset(s->tpmbe);
 
+    memset(s->regs, 0, sizeof(s->regs));
+
+    ARRAY_FIELD_DP32(s->regs, CRB_LOC_STATE,
+                     tpmRegValidSts, 1);
+    ARRAY_FIELD_DP32(s->regs, CRB_CTRL_STS,
+                     tpmIdle, 1);
     ARRAY_FIELD_DP32(s->regs, CRB_INTF_ID,
                      InterfaceType, CRB_INTF_TYPE_CRB_ACTIVE);
     ARRAY_FIELD_DP32(s->regs, CRB_INTF_ID,
@@ -265,6 +266,32 @@ static void tpm_crb_realize(DeviceState *dev, Error **errp)
                             CRB_CTRL_CMD_SIZE);
 
     tpm_backend_startup_tpm(s->tpmbe, s->be_buffer_size);
+}
+
+static void tpm_crb_realize(DeviceState *dev, Error **errp)
+{
+    CRBState *s = CRB(dev);
+
+    if (!tpm_find()) {
+        error_setg(errp, "at most one TPM device is permitted");
+        return;
+    }
+    if (!s->tpmbe) {
+        error_setg(errp, "'tpmdev' property is required");
+        return;
+    }
+
+    memory_region_init_io(&s->mmio, OBJECT(s), &tpm_crb_memory_ops, s,
+        "tpm-crb-mmio", sizeof(s->regs));
+    memory_region_init_ram(&s->cmdmem, OBJECT(s),
+        "tpm-crb-cmd", CRB_CTRL_CMD_SIZE, errp);
+
+    memory_region_add_subregion(get_system_memory(),
+        TPM_CRB_ADDR_BASE, &s->mmio);
+    memory_region_add_subregion(get_system_memory(),
+        TPM_CRB_ADDR_BASE + sizeof(s->regs), &s->cmdmem);
+
+    qemu_register_reset(tpm_crb_reset, dev);
 }
 
 static void tpm_crb_class_init(ObjectClass *klass, void *data)

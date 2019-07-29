@@ -13,9 +13,11 @@
 #include "net/vhost_net.h"
 #include "net/vhost-user.h"
 #include "chardev/char-fe.h"
+#include "qapi/error.h"
+#include "qapi/qapi-commands-net.h"
 #include "qemu/config-file.h"
 #include "qemu/error-report.h"
-#include "qmp-commands.h"
+#include "qemu/option.h"
 #include "trace.h"
 
 typedef struct VhostUserState {
@@ -107,6 +109,7 @@ static int vhost_user_start(int queues, NetClientState *ncs[], CharBackend *be)
 err:
     if (net) {
         vhost_net_cleanup(net);
+        g_free(net);
     }
     vhost_user_stop(i, ncs);
     return -1;
@@ -296,7 +299,7 @@ static int net_vhost_user_init(NetClientState *peer, const char *device,
             s = DO_UPCAST(VhostUserState, nc, nc);
             if (!qemu_chr_fe_init(&s->chr, chr, &err)) {
                 error_report_err(err);
-                return -1;
+                goto err;
             }
         }
 
@@ -306,7 +309,7 @@ static int net_vhost_user_init(NetClientState *peer, const char *device,
     do {
         if (qemu_chr_fe_wait_connected(&s->chr, &err) < 0) {
             error_report_err(err);
-            return -1;
+            goto err;
         }
         qemu_chr_fe_set_handlers(&s->chr, NULL, NULL,
                                  net_vhost_user_event, NULL, nc0->name, NULL,
@@ -316,6 +319,13 @@ static int net_vhost_user_init(NetClientState *peer, const char *device,
     assert(s->vhost_net);
 
     return 0;
+
+err:
+    if (nc0) {
+        qemu_del_net_client(nc0);
+    }
+
+    return -1;
 }
 
 static Chardev *net_vhost_claim_chardev(

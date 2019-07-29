@@ -167,16 +167,37 @@ static void raw_reopen_abort(BDRVReopenState *state)
     state->opaque = NULL;
 }
 
+/* Check and adjust the offset, against 'offset' and 'size' options. */
+static inline int raw_adjust_offset(BlockDriverState *bs, uint64_t *offset,
+                                    uint64_t bytes, bool is_write)
+{
+    BDRVRawState *s = bs->opaque;
+
+    if (s->has_size && (*offset > s->size || bytes > (s->size - *offset))) {
+        /* There's not enough space for the write, or the read request is
+         * out-of-range. Don't read/write anything to prevent leaking out of
+         * the size specified in options. */
+        return is_write ? -ENOSPC : -EINVAL;;
+    }
+
+    if (*offset > INT64_MAX - s->offset) {
+        return -EINVAL;
+    }
+    *offset += s->offset;
+
+    return 0;
+}
+
 static int coroutine_fn raw_co_preadv(BlockDriverState *bs, uint64_t offset,
                                       uint64_t bytes, QEMUIOVector *qiov,
                                       int flags)
 {
-    BDRVRawState *s = bs->opaque;
+    int ret;
 
-    if (offset > UINT64_MAX - s->offset) {
-        return -EINVAL;
+    ret = raw_adjust_offset(bs, &offset, bytes, false);
+    if (ret) {
+        return ret;
     }
-    offset += s->offset;
 
     BLKDBG_EVENT(bs->file, BLKDBG_READ_AIO);
     return bdrv_co_preadv(bs->file, offset, bytes, qiov, flags);
@@ -186,22 +207,10 @@ static int coroutine_fn raw_co_pwritev(BlockDriverState *bs, uint64_t offset,
                                        uint64_t bytes, QEMUIOVector *qiov,
                                        int flags)
 {
-    BDRVRawState *s = bs->opaque;
     void *buf = NULL;
     BlockDriver *drv;
     QEMUIOVector local_qiov;
     int ret;
-
-    if (s->has_size && (offset > s->size || bytes > (s->size - offset))) {
-        /* There's not enough space for the data. Don't write anything and just
-         * fail to prevent leaking out of the size specified in options. */
-        return -ENOSPC;
-    }
-
-    if (offset > UINT64_MAX - s->offset) {
-        ret = -EINVAL;
-        goto fail;
-    }
 
     if (bs->probed && offset < BLOCK_PROBE_BUF_SIZE && bytes) {
         /* Handling partial writes would be a pain - so we just
@@ -237,7 +246,10 @@ static int coroutine_fn raw_co_pwritev(BlockDriverState *bs, uint64_t offset,
         qiov = &local_qiov;
     }
 
-    offset += s->offset;
+    ret = raw_adjust_offset(bs, &offset, bytes, true);
+    if (ret) {
+        goto fail;
+    }
 
     BLKDBG_EVENT(bs->file, BLKDBG_WRITE_AIO);
     ret = bdrv_co_pwritev(bs->file, offset, bytes, qiov, flags);
@@ -250,39 +262,41 @@ fail:
     return ret;
 }
 
-static int64_t coroutine_fn raw_co_get_block_status(BlockDriverState *bs,
-                                            int64_t sector_num,
-                                            int nb_sectors, int *pnum,
+static int coroutine_fn raw_co_block_status(BlockDriverState *bs,
+                                            bool want_zero, int64_t offset,
+                                            int64_t bytes, int64_t *pnum,
+                                            int64_t *map,
                                             BlockDriverState **file)
 {
     BDRVRawState *s = bs->opaque;
-    *pnum = nb_sectors;
+    *pnum = bytes;
     *file = bs->file->bs;
-    sector_num += s->offset / BDRV_SECTOR_SIZE;
-    return BDRV_BLOCK_RAW | BDRV_BLOCK_OFFSET_VALID |
-           (sector_num << BDRV_SECTOR_BITS);
+    *map = offset + s->offset;
+    return BDRV_BLOCK_RAW | BDRV_BLOCK_OFFSET_VALID;
 }
 
 static int coroutine_fn raw_co_pwrite_zeroes(BlockDriverState *bs,
                                              int64_t offset, int bytes,
                                              BdrvRequestFlags flags)
 {
-    BDRVRawState *s = bs->opaque;
-    if (offset > UINT64_MAX - s->offset) {
-        return -EINVAL;
+    int ret;
+
+    ret = raw_adjust_offset(bs, (uint64_t *)&offset, bytes, true);
+    if (ret) {
+        return ret;
     }
-    offset += s->offset;
     return bdrv_co_pwrite_zeroes(bs->file, offset, bytes, flags);
 }
 
 static int coroutine_fn raw_co_pdiscard(BlockDriverState *bs,
                                         int64_t offset, int bytes)
 {
-    BDRVRawState *s = bs->opaque;
-    if (offset > UINT64_MAX - s->offset) {
-        return -EINVAL;
+    int ret;
+
+    ret = raw_adjust_offset(bs, (uint64_t *)&offset, bytes, true);
+    if (ret) {
+        return ret;
     }
-    offset += s->offset;
     return bdrv_co_pdiscard(bs->file->bs, offset, bytes);
 }
 
@@ -396,7 +410,8 @@ static int raw_has_zero_init(BlockDriverState *bs)
     return bdrv_has_zero_init(bs->file->bs);
 }
 
-static int raw_create(const char *filename, QemuOpts *opts, Error **errp)
+static int coroutine_fn raw_co_create_opts(const char *filename, QemuOpts *opts,
+                                           Error **errp)
 {
     return bdrv_create_file(filename, opts, errp);
 }
@@ -491,12 +506,12 @@ BlockDriver bdrv_raw = {
     .bdrv_open            = &raw_open,
     .bdrv_close           = &raw_close,
     .bdrv_child_perm      = bdrv_filter_default_perms,
-    .bdrv_create          = &raw_create,
+    .bdrv_co_create_opts  = &raw_co_create_opts,
     .bdrv_co_preadv       = &raw_co_preadv,
     .bdrv_co_pwritev      = &raw_co_pwritev,
     .bdrv_co_pwrite_zeroes = &raw_co_pwrite_zeroes,
     .bdrv_co_pdiscard     = &raw_co_pdiscard,
-    .bdrv_co_get_block_status = &raw_co_get_block_status,
+    .bdrv_co_block_status = &raw_co_block_status,
     .bdrv_truncate        = &raw_truncate,
     .bdrv_getlength       = &raw_getlength,
     .has_variable_length  = true,
